@@ -60,6 +60,8 @@
   .dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
   .status{font-size:12px;color:var(--muted);margin-top:4px}
   .empty{text-align:center;color:var(--muted);padding:30px 0}
+  .filter.on{background:var(--blue);border-color:var(--blue);color:#fff}
+  .warn{color:var(--yellow);font-size:12px;margin-top:6px}
   .log{font-size:12px;color:var(--muted);margin-top:8px;border-top:1px dashed var(--line);padding-top:6px}
 </style>
 </head>
@@ -87,6 +89,13 @@
     </select>
     <button id="btnSettings">⚙︎</button>
   </div>
+  <input id="search" type="search" placeholder="🔍 Suchen …" style="width:100%;margin-bottom:6px">
+  <div class="bar" style="margin:4px 0 8px">
+    <button class="small filter" data-f="all">Alle</button>
+    <button class="small filter" data-f="buy">🟢 Kaufen</button>
+    <button class="small filter" data-f="sell">🔴 Verkaufen</button>
+    <button class="small filter" data-f="watch">🟡 Beobachten</button>
+  </div>
   <div class="status" id="status"></div>
 
   <div class="hint" id="hint"></div>
@@ -99,12 +108,14 @@
   <h2 id="dlgTitle">Aktie</h2>
   <label>Name</label>
   <input id="fName" placeholder="z. B. Apple">
-  <label>Ticker (für Live-Kurse, z. B. AAPL)</label>
+  <label>Yahoo-Ticker (z. B. AAPL, SAP.DE, 7203.T)</label>
   <input id="fTicker" placeholder="AAPL" autocapitalize="characters">
-  <label>Referenzkurs (dein letzter Kauf/Verkauf) in €/$</label>
+  <label>Referenzkurs in € (dein letzter Kauf/Verkauf)</label>
   <input id="fRef" type="number" step="0.01" inputmode="decimal">
-  <label>Aktueller Kurs (optional, wenn keine Live-Kurse)</label>
+  <label>Aktueller Kurs in € (nur nötig ohne Ticker)</label>
   <input id="fCur" type="number" step="0.01" inputmode="decimal">
+  <label>Eigene Schwelle in % (leer = Standard)</label>
+  <input id="fThr" type="number" step="0.5" inputmode="decimal" placeholder="z. B. 20 für sehr volatile Werte">
   <label>Notiz</label>
   <input id="fNote" placeholder="z. B. 5 Stück gehalten">
   <div class="dlg-actions">
@@ -130,75 +141,82 @@
     <option value="5">±5 %</option>
     <option value="7.5">±7,5 %</option>
   </select>
-  <label>Finnhub API-Key (kostenlos auf finnhub.io – für Live-Kurse)</label>
-  <input id="sKey" placeholder="leer = Kurse manuell eintragen">
   <label>Liste exportieren / importieren (JSON)</label>
   <textarea id="sJson"></textarea>
   <div class="dlg-actions">
     <button class="ghost" id="btnImport">Importieren</button>
+    <button class="ghost" id="btnReset" style="color:var(--red)">Liste zurücksetzen</button>
     <button class="ghost" data-close>Schließen</button>
     <button class="primary" id="btnSaveSettings">Speichern</button>
   </div>
 </dialog>
 
 <script>
-const STORE = 'aktien-uebersicht-v1';
-
-// Platzhalter-Liste – wird durch deine eigene Liste ersetzt
-const DEFAULT_STOCKS = [
-  {name:'Apple',      ticker:'AAPL'},
-  {name:'Microsoft',  ticker:'MSFT'},
-  {name:'Nvidia',     ticker:'NVDA'},
-  {name:'Amazon',     ticker:'AMZN'},
-  {name:'Alphabet',   ticker:'GOOGL'},
-  {name:'Meta',       ticker:'META'},
-  {name:'Tesla',      ticker:'TSLA'},
-  {name:'Broadcom',   ticker:'AVGO'},
-];
-
+const STORE = 'aktien-uebersicht-v2';
 function uid(){ return Math.random().toString(36).slice(2,9); }
 
-function load(){
-  try{
-    const s = JSON.parse(localStorage.getItem(STORE));
-    if(s && Array.isArray(s.stocks)) return s;
-  }catch(e){}
-  return {
-    threshold:10, watch:5, apiKey:'',
-    stocks: DEFAULT_STOCKS.map(s=>({id:uid(), ...s, ref:null, cur:null, day:null, note:'', log:[]}))
-  };
-}
-let state = load();
+let state = null;
 function save(){ try{ localStorage.setItem(STORE, JSON.stringify(state)); }catch(e){} }
 
+async function defaultList(){
+  try{
+    const r = await fetch('stocks.json?t='+Date.now());
+    const arr = await r.json();
+    return arr.map(s=>({id:uid(), name:s.name, ticker:s.ticker||'', ref:s.ref, cur:s.ref, day:s.day, thr:null, note:'', log:[]}));
+  }catch(e){ return []; }
+}
+async function init(){
+  try{ const s = JSON.parse(localStorage.getItem(STORE)); if(s && Array.isArray(s.stocks)) state = s; }catch(e){}
+  if(!state){ state = {threshold:10, watch:5, updated:null, stocks: await defaultList()}; save(); }
+  render();
+  refresh(true);
+}
+
 const $ = id => document.getElementById(id);
-const fmt = n => n==null||isNaN(n) ? '–' : n.toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2});
+const fmt = n => n==null||isNaN(n) ? '–' : n.toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits: n<1?3:2});
 const fmtPct = n => n==null||isNaN(n) ? '–' : (n>0?'+':'')+n.toLocaleString('de-DE',{minimumFractionDigits:1,maximumFractionDigits:1})+' %';
 const cls = n => n==null||isNaN(n) ? 'flat' : n>0?'up':n<0?'down':'flat';
+const pctTxt = n => String(n).replace('.',',');
+function esc(t){ return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+const thrOf = s => s.thr || state.threshold;
 function change(s){
   if(s.ref==null || s.cur==null || !s.ref) return null;
   return (s.cur - s.ref) / s.ref * 100;
 }
 function signal(s){
-  const c = change(s);
+  const c = change(s), T = thrOf(s);
   if(c==null) return {key:'hold', label:'Referenz fehlt', rank:4};
-  if(c <= -state.threshold) return {key:'buy',  label:'KAUFEN 🟢', rank:0};
-  if(c >=  state.threshold) return {key:'sell', label:'VERKAUFEN 🔴', rank:1};
-  if(Math.abs(c) >= state.watch) return {key:'watch', label:c<0?'Beobachten ↓':'Beobachten ↑', rank:2};
+  if(c <= -T) return {key:'buy',  label:'KAUFEN 🟢', rank:0};
+  if(c >=  T) return {key:'sell', label:'VERKAUFEN 🔴', rank:1};
+  if(Math.abs(c) >= Math.min(state.watch, T*0.75)) return {key:'watch', label:c<0?'Beobachten ↓':'Beobachten ↑', rank:2};
   return {key:'hold', label:'Halten', rank:3};
 }
 
-function render(){
-  $('ruleLabel').textContent = '±'+String(state.threshold).replace('.',',')+' %';
-  $('hint').innerHTML =
-    `<b>So funktioniert's:</b> Der <b>Referenzkurs</b> ist dein letzter Kauf- oder Verkaufskurs. `+
-    `Fällt die Aktie davon um <b>${String(state.threshold).replace('.',',')} %</b> → <span class="up">nachkaufen</span>, `+
-    `steigt sie um ${String(state.threshold).replace('.',',')} % → <span class="down">Teil verkaufen</span>. `+
-    `Nach dem Trade auf „Gekauft“/„Verkauft“ tippen – dann zählt der neue Kurs als Referenz.`;
+let filter = 'all';
+document.querySelectorAll('.filter').forEach(b=>b.onclick=()=>{ filter=b.dataset.f; render(); });
+$('search').oninput = render;
 
+function render(){
+  document.querySelectorAll('.filter').forEach(b=>b.classList.toggle('on', b.dataset.f===filter));
+  $('ruleLabel').textContent = '±'+pctTxt(state.threshold)+' %';
+  $('hint').innerHTML =
+    `<b>So funktioniert's:</b> Der <b>Referenzkurs</b> ist dein letzter Kauf- oder Verkaufskurs (Start: Kurs vom 24.11.). `+
+    `Fällt die Aktie davon um <b>${pctTxt(state.threshold)} %</b> → <span class="up">nachkaufen</span>, `+
+    `steigt sie um ${pctTxt(state.threshold)} % → <span class="down">Teil verkaufen</span>. `+
+    `Nach dem Trade „Gekauft“/„Verkauft“ tippen – dann zählt der neue Kurs als Referenz.`;
+
+  const q = $('search').value.trim().toLowerCase();
   const sort = $('sortSel').value;
-  const arr = [...state.stocks];
+  let nb=0, ns=0, nw=0;
+  state.stocks.forEach(s=>{ const k=signal(s).key; if(k==='buy')nb++; if(k==='sell')ns++; if(k==='watch')nw++; });
+  $('cntBuy').textContent=nb; $('cntSell').textContent=ns; $('cntWatch').textContent=nw;
+
+  const arr = state.stocks.filter(s=>{
+    if(q && !(s.name.toLowerCase().includes(q) || (s.ticker||'').toLowerCase().includes(q))) return false;
+    if(filter!=='all' && signal(s).key!==filter) return false;
+    return true;
+  });
   arr.sort((a,b)=>{
     if(sort==='name') return a.name.localeCompare(b.name);
     if(sort==='change') return (change(a)??999) - (change(b)??999);
@@ -208,35 +226,33 @@ function render(){
     return Math.abs(change(b)??0) - Math.abs(change(a)??0);
   });
 
-  let nb=0, ns=0, nw=0;
-  const html = arr.map(s=>{
-    const c = change(s), sg = signal(s);
-    if(sg.key==='buy') nb++; if(sg.key==='sell') ns++; if(sg.key==='watch') nw++;
-    // Meter: -T..+T auf 0..100 %
-    const T = state.threshold;
+  $('list').innerHTML = arr.map(s=>{
+    const c = change(s), sg = signal(s), T = thrOf(s);
     let fill = '';
     if(c!=null){
-      const v = Math.max(-T, Math.min(T, c));
-      const w = Math.abs(v)/T*50;
-      const left = v<0 ? 50-w : 50;
+      const v = Math.max(-T, Math.min(T, c)), w = Math.abs(v)/T*50, left = v<0 ? 50-w : 50;
       const col = sg.key==='buy'?'var(--green)':sg.key==='sell'?'var(--red)':sg.key==='watch'?'var(--yellow)':'var(--blue)';
       fill = `<div class="fill" style="left:${left}%;width:${w}%;background:${col}"></div>`;
     }
     const last = s.log && s.log.length ? s.log[s.log.length-1] : null;
+    let warn = '';
+    if(!s.ticker) warn = '⚠️ Kein Ticker – Kurs wird nicht automatisch geladen (Bearbeiten → Ticker eintragen).';
+    else if(s.missing) warn = '⚠️ Ticker nicht gefunden – bitte prüfen.';
+    else if(c!=null && Math.abs(c) > 40) warn = '⚠️ Riesige Abweichung – vermutlich falscher Ticker/Börse. Bitte prüfen.';
     return `
     <div class="card ${sg.key}">
       <div class="row">
         <div>
           <div class="name">${esc(s.name)}</div>
-          <div class="ticker">${esc(s.ticker||'')}${s.note?' · '+esc(s.note):''}</div>
+          <div class="ticker">${esc(s.ticker||'kein Ticker')}${s.thr?' · Schwelle ±'+pctTxt(s.thr)+' %':''}${s.note?' · '+esc(s.note):''}</div>
         </div>
         <div>
-          <div class="price">${fmt(s.cur)}</div>
+          <div class="price">${fmt(s.cur)} €</div>
           <div style="text-align:right"><span class="badge ${sg.key}">${sg.label}</span></div>
         </div>
       </div>
       <div class="meter"><div class="mid"></div>${fill}</div>
-      <div class="meter-l"><span>−${String(T).replace('.',',')} % kaufen</span><span>+${String(T).replace('.',',')} % verkaufen</span></div>
+      <div class="meter-l"><span>−${pctTxt(T)} % kaufen</span><span>+${pctTxt(T)} % verkaufen</span></div>
       <div class="meta">
         <div>Seit Referenz: <b class="${cls(c)}">${fmtPct(c)}</b></div>
         <div>Heute: <b class="${cls(s.day)}">${fmtPct(s.day)}</b></div>
@@ -245,42 +261,36 @@ function render(){
         <div></div>
         <div>Verkauf bei ≥ <b class="down">${s.ref?fmt(s.ref*(1+T/100)):'–'}</b></div>
       </div>
+      ${warn?`<div class="warn">${warn}</div>`:''}
       <div class="actions">
         <button class="small" onclick="trade('${s.id}','Gekauft')">✅ Gekauft</button>
         <button class="small" onclick="trade('${s.id}','Verkauft')">💰 Verkauft</button>
         <button class="small ghost" onclick="editStock('${s.id}')">✏️ Bearbeiten</button>
       </div>
-      ${last?`<div class="log">Letzte Aktion: ${last.type} zu ${fmt(last.price)} am ${last.date}</div>`:''}
+      ${last?`<div class="log">Letzte Aktion: ${last.type} zu ${fmt(last.price)} € am ${last.date}</div>`:''}
     </div>`;
-  }).join('');
-  $('list').innerHTML = html || '<div class="empty">Noch keine Aktien – tippe auf „＋ Aktie“.</div>';
-  $('cntBuy').textContent=nb; $('cntSell').textContent=ns; $('cntWatch').textContent=nw;
+  }).join('') || '<div class="empty">Keine Treffer.</div>';
 }
-function esc(t){ return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-// Trade: aktuellen Kurs als neue Referenz setzen
 function trade(id, type){
   const s = state.stocks.find(x=>x.id===id);
-  let price = s.cur;
-  const input = prompt(`${type}: zu welchem Kurs? (neue Referenz)`, price!=null? String(price).replace('.',',') : '');
+  const input = prompt(`${type}: zu welchem Kurs (€)? Wird die neue Referenz.`, s.cur!=null? String(s.cur).replace('.',',') : '');
   if(input===null) return;
-  price = parseFloat(input.replace(',','.'));
+  const price = parseFloat(input.replace(',','.'));
   if(isNaN(price)) return;
   s.ref = price;
   if(s.cur==null) s.cur = price;
-  s.log = s.log||[];
-  s.log.push({type, price, date:new Date().toLocaleDateString('de-DE')});
+  (s.log = s.log||[]).push({type, price, date:new Date().toLocaleDateString('de-DE')});
   save(); render();
 }
 
-// Bearbeiten-Dialog
 let editingId = null;
 function editStock(id){
   editingId = id;
-  const s = id ? state.stocks.find(x=>x.id===id) : {name:'',ticker:'',ref:null,cur:null,note:''};
+  const s = id ? state.stocks.find(x=>x.id===id) : {name:'',ticker:'',ref:null,cur:null,thr:null,note:''};
   $('dlgTitle').textContent = id ? 'Aktie bearbeiten' : 'Aktie hinzufügen';
   $('fName').value = s.name; $('fTicker').value = s.ticker||'';
-  $('fRef').value = s.ref ?? ''; $('fCur').value = s.cur ?? ''; $('fNote').value = s.note||'';
+  $('fRef').value = s.ref ?? ''; $('fCur').value = s.cur ?? ''; $('fThr').value = s.thr ?? ''; $('fNote').value = s.note||'';
   $('btnDelete').style.display = id ? '' : 'none';
   $('dlgStock').showModal();
 }
@@ -288,10 +298,11 @@ $('btnAdd').onclick = ()=>editStock(null);
 $('btnSave').onclick = ()=>{
   const num = v => v==='' ? null : parseFloat(String(v).replace(',','.'));
   const data = {name:$('fName').value.trim()||'Ohne Name', ticker:$('fTicker').value.trim().toUpperCase(),
-                ref:num($('fRef').value), cur:num($('fCur').value), note:$('fNote').value.trim()};
-  if(editingId){ Object.assign(state.stocks.find(x=>x.id===editingId), data); }
+                ref:num($('fRef').value), cur:num($('fCur').value), thr:num($('fThr').value), note:$('fNote').value.trim()};
+  if(editingId){ Object.assign(state.stocks.find(x=>x.id===editingId), data, {missing:false}); }
   else state.stocks.push({id:uid(), day:null, log:[], ...data});
   save(); render(); $('dlgStock').close();
+  if(data.ticker) refresh(true);
 };
 $('btnDelete').onclick = ()=>{
   if(!confirm('Aktie wirklich löschen?')) return;
@@ -300,18 +311,15 @@ $('btnDelete').onclick = ()=>{
 };
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 
-// Einstellungen
 $('btnSettings').onclick = ()=>{
   $('sThreshold').value = String(state.threshold);
   $('sWatch').value = String(state.watch);
-  $('sKey').value = state.apiKey||'';
-  $('sJson').value = JSON.stringify(state.stocks.map(({id,day,...r})=>r), null, 1);
+  $('sJson').value = JSON.stringify(state.stocks.map(({id,day,cur,missing,...r})=>r), null, 1);
   $('dlgSettings').showModal();
 };
 $('btnSaveSettings').onclick = ()=>{
   state.threshold = parseFloat($('sThreshold').value);
   state.watch = parseFloat($('sWatch').value);
-  state.apiKey = $('sKey').value.trim();
   save(); render(); $('dlgSettings').close();
 };
 $('btnImport').onclick = ()=>{
@@ -319,41 +327,44 @@ $('btnImport').onclick = ()=>{
     const arr = JSON.parse($('sJson').value);
     if(!Array.isArray(arr)) throw 0;
     state.stocks = arr.map(r=>({id:uid(), name:r.name||'?', ticker:(r.ticker||'').toUpperCase(),
-      ref:r.ref??null, cur:r.cur??null, day:null, note:r.note||'', log:r.log||[]}));
-    save(); render(); $('dlgSettings').close();
+      ref:r.ref??null, cur:r.ref??null, day:null, thr:r.thr??null, note:r.note||'', log:r.log||[]}));
+    save(); render(); $('dlgSettings').close(); refresh(true);
   }catch(e){ alert('Ungültiges JSON'); }
+};
+$('btnReset').onclick = async ()=>{
+  if(!confirm('Liste auf Standard zurücksetzen? Deine Referenzkurse & Trades gehen verloren.')) return;
+  state.stocks = await defaultList(); save(); render(); $('dlgSettings').close(); refresh(true);
 };
 $('sortSel').onchange = render;
 
-// Live-Kurse über Finnhub (kostenloser Key, US-Ticker im Free-Plan)
-async function refresh(){
-  if(!state.apiKey){
-    $('status').textContent = 'Kein API-Key: Kurse über „Bearbeiten“ eintragen oder in ⚙︎ einen Finnhub-Key hinterlegen.';
-    return;
-  }
-  $('status').textContent = 'Lade Kurse …';
-  let ok=0, fail=[];
-  for(const s of state.stocks){
-    if(!s.ticker){ continue; }
-    try{
-      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(s.ticker)}&token=${encodeURIComponent(state.apiKey)}`);
-      const q = await r.json();
-      if(q && q.c){
-        s.cur = q.c; s.day = q.dp;
-        if(s.ref==null) s.ref = q.c; // erste Ladung: aktueller Kurs = Startreferenz
+// Kurse kommen aus prices.json – wird von der GitHub Action alle 15 Min. aktualisiert
+async function refresh(silent){
+  if(!silent) $('status').textContent = 'Lade Kurse …';
+  try{
+    const r = await fetch('prices.json?t='+Date.now(), {cache:'no-store'});
+    if(!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    let ok=0;
+    for(const s of state.stocks){
+      if(!s.ticker) continue;
+      const p = data.prices[s.ticker];
+      if(p && p.eur){
+        s.cur = p.eur; s.day = p.day; s.missing = false;
+        if(s.ref==null) s.ref = p.eur;
         ok++;
-      } else fail.push(s.ticker);
-    }catch(e){ fail.push(s.ticker); }
-    await new Promise(r=>setTimeout(r,120)); // Rate-Limit schonen
+      } else if((data.failed||[]).includes(s.ticker)) s.missing = true;
+    }
+    state.updated = data.updated;
+    save(); render();
+    const t = new Date(data.updated);
+    $('status').textContent = `Kurse vom ${t.toLocaleDateString('de-DE')} ${t.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'})} · ${ok} von ${state.stocks.length} automatisch`;
+  }catch(e){
+    $('status').textContent = 'Noch keine Live-Kurse verfügbar (prices.json fehlt – läuft die GitHub Action?). Angezeigt: Kurse vom 24.11.';
   }
-  save(); render();
-  $('status').textContent = `Aktualisiert ${new Date().toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'})} · ${ok} Kurse`+
-    (fail.length?` · nicht gefunden: ${fail.join(', ')}`:'');
 }
-$('btnRefresh').onclick = refresh;
+$('btnRefresh').onclick = ()=>refresh(false);
 
-render();
-if(state.apiKey) refresh();
+init();
 </script>
 </body>
 </html>
