@@ -60,6 +60,8 @@
   .dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
   .status{font-size:12px;color:var(--muted);margin-top:4px}
   .empty{text-align:center;color:var(--muted);padding:30px 0}
+  .period.on{background:#e8eaef;border-color:#e8eaef;color:#0f1115;font-weight:700}
+  .periods-row{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:6px}
   .filter.on{background:var(--blue);border-color:var(--blue);color:#fff}
   .warn{color:var(--yellow);font-size:12px;margin-top:6px}
   .log{font-size:12px;color:var(--muted);margin-top:8px;border-top:1px dashed var(--line);padding-top:6px}
@@ -90,6 +92,7 @@
     <button id="btnSettings">⚙︎</button>
   </div>
   <input id="search" type="search" placeholder="🔍 Suchen …" style="width:100%;margin-bottom:6px">
+  <div class="bar" id="periods" style="margin:4px 0 2px"></div>
   <div class="bar" style="margin:4px 0 8px">
     <button class="small filter" data-f="all">Alle</button>
     <button class="small filter" data-f="buy">🟢 Kaufen</button>
@@ -139,6 +142,9 @@
   <select id="sMode">
     <option value="last">Stand beim letzten Laden (Knopf „Kurse laden“)</option>
     <option value="day">Vortag (Tagesveränderung)</option>
+    <option value="w1">Kurs vor 1 Woche</option>
+    <option value="m1">Kurs vor 1 Monat</option>
+    <option value="m3">Kurs vor 3 Monaten</option>
     <option value="trade">Meinem letzten Kauf/Verkauf</option>
   </select>
   <label>Frühwarnung „Beobachten“ ab</label>
@@ -173,10 +179,12 @@ async function defaultList(){
     return arr.map(s=>({id:uid(), name:s.name, ticker:s.ticker||'', ref:s.ref, cur:s.ref, day:s.day, thr:null, note:'', log:[]}));
   }catch(e){ return []; }
 }
+function setMode(m){ state.mode = m; save(); render(); }
 async function init(){
   try{ const s = JSON.parse(localStorage.getItem(STORE)); if(s && Array.isArray(s.stocks)) state = s; }catch(e){}
   if(!state){ state = {threshold:10, watch:5, updated:null, stocks: await defaultList()}; save(); }
   render();
+  loadHistory().then(render);
   $('status').textContent = state.updated ? 'Zuletzt geladen: '+new Date(state.updated).toLocaleString('de-DE',{dateStyle:'short',timeStyle:'short'})+' · Tippe „↻ Kurse laden“' : 'Tippe „↻ Kurse laden“';
 }
 
@@ -189,22 +197,57 @@ function esc(t){ return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 
 const thrOf = s => s.thr || state.threshold;
 const MODES = {
-  last:  {label:'seit letztem Laden', since:'Seit letztem Laden', base:'Stand letztes Laden'},
-  day:   {label:'seit Vortag',        since:'Seit Vortag',        base:'Vortagesschluss'},
-  trade: {label:'seit letztem Kauf/Verkauf', since:'Seit Kauf/Verkauf', base:'Referenz (Trade)'}
+  last:  {chip:'Seit Laden', label:'seit letztem Laden', since:'Seit letztem Laden', base:'Stand letztes Laden'},
+  day:   {chip:'Heute',      label:'seit Vortag',        since:'Seit Vortag',        base:'Vortagesschluss'},
+  w1:    {chip:'1 Woche',    label:'in 1 Woche',  since:'1 Woche',  base:'Kurs vor 1 Woche',  days:7},
+  m1:    {chip:'1 Monat',    label:'in 1 Monat',  since:'1 Monat',  base:'Kurs vor 1 Monat',  days:30},
+  m3:    {chip:'3 Monate',   label:'in 3 Monaten',since:'3 Monate', base:'Kurs vor 3 Monaten',days:91},
+  trade: {chip:'Seit Kauf',  label:'seit letztem Kauf/Verkauf', since:'Seit Kauf/Verkauf', base:'Referenz (Trade)'}
 };
-const mode = () => state.mode || 'last';
-function base(s){
-  if(mode()==='day') return (s.day!=null && s.cur) ? s.cur/(1+s.day/100) : null;
-  if(mode()==='last') return s.prev ?? null;
-  return s.ref ?? null;
+const mode = () => MODES[state.mode] ? state.mode : 'last';
+
+// ---- Kurshistorie: history.json (GitHub Action, täglich) + lokale Stände bei jedem Laden ----
+let SERVER_HIST = {};
+const hkey = s => s.ticker || ('name:'+s.name);
+const isoDay = d => new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,10);
+async function loadHistory(){
+  try{ const r = await fetch('history.json?t='+Date.now(), {cache:'no-store'}); if(r.ok) SERVER_HIST = await r.json(); }catch(e){}
 }
-function change(s){
-  if(mode()==='day') return s.day ?? null;
-  const b = base(s);
+function recordLocal(){
+  const d = isoDay(new Date());
+  state.hist = state.hist || {};
+  const row = state.hist[d] = state.hist[d] || {};
+  for(const s of state.stocks) if(s.cur!=null) row[hkey(s)] = s.cur;
+  const cut = isoDay(new Date(Date.now()-400*864e5));
+  for(const k of Object.keys(state.hist)) if(k<cut) delete state.hist[k];
+}
+// Kurs zum Stichtag (heute − days); gibt es so alte Daten noch nicht → ältester bekannter Kurs (partial)
+function histBase(s, days){
+  const k = hkey(s), today = isoDay(new Date()), target = isoDay(new Date(Date.now()-days*864e5));
+  const val = d => (SERVER_HIST[d] && SERVER_HIST[d][k]) ?? (state.hist && state.hist[d] && state.hist[d][k]);
+  const dates = [...new Set([...Object.keys(SERVER_HIST), ...Object.keys(state.hist||{})])].sort();
+  let hit = null;
+  for(const d of dates){ if(d > target) break; if(val(d)!=null) hit = d; }
+  if(hit) return {v: val(hit), d: hit, partial:false};
+  for(const d of dates){ if(d >= today) break; if(val(d)!=null) return {v: val(d), d, partial:true}; }
+  return null;
+}
+const ddmm = d => d.slice(8,10)+'.'+d.slice(5,7)+'.';
+
+function baseFor(s, m){
+  if(m==='day') return (s.day!=null && s.cur) ? s.cur/(1+s.day/100) : null;
+  if(m==='last') return s.prev ?? null;
+  if(m==='trade') return s.ref ?? null;
+  const h = histBase(s, MODES[m].days); return h ? h.v : null;
+}
+function changeFor(s, m){
+  if(m==='day') return s.day ?? null;
+  const b = baseFor(s, m);
   if(!b || s.cur==null) return null;
   return (s.cur - b) / b * 100;
 }
+const base = s => baseFor(s, mode());
+const change = s => changeFor(s, mode());
 // neuen Kurs setzen; bei roll=true wird der bisherige Kurs zur Vergleichsbasis („letztes Laden“)
 function setPrice(s, eur, day, roll){
   if(roll && s.cur!=null) s.prev = s.cur;
@@ -229,10 +272,11 @@ function render(){
   document.querySelectorAll('.filter').forEach(b=>b.classList.toggle('on', b.dataset.f===filter));
   $('ruleLabel').textContent = '±'+pctTxt(state.threshold)+' %';
   $('modeLabel').textContent = MODES[mode()].label;
+  $('periods').innerHTML = Object.entries(MODES).map(([k,v])=>`<button class="small period${k===mode()?' on':''}" onclick="setMode('${k}')">${v.chip}</button>`).join('');
   $('hint').innerHTML =
-    `<b>So funktioniert's:</b> Verglichen wird ${({last:'mit dem Kurs beim <b>letzten Tippen auf „Kurse laden“</b>',day:'mit dem <b>Schlusskurs vom Vortag</b>',trade:'mit deinem <b>letzten Kauf-/Verkaufskurs</b>'})[mode()]}. `+
+    `<b>So funktioniert's:</b> Verglichen wird ${({last:'mit dem Kurs beim <b>letzten Tippen auf „Kurse laden“</b>',day:'mit dem <b>Schlusskurs vom Vortag</b>',w1:'mit dem Kurs <b>vor 1 Woche</b>',m1:'mit dem Kurs <b>vor 1 Monat</b>',m3:'mit dem Kurs <b>vor 3 Monaten</b>',trade:'mit deinem <b>letzten Kauf-/Verkaufskurs</b>'})[mode()]}. `+
     `Minus <b>${pctTxt(state.threshold)} %</b> → <span class="up">nachkaufen</span>, plus ${pctTxt(state.threshold)} % → <span class="down">Teil verkaufen</span>. `+
-    `Vergleichsbasis änderst du unter ⚙︎.`;
+    `Zeitraum oben wählen. * = so alte Kurse gibt es noch nicht, verglichen wird mit dem ältesten bekannten Kurs.`;
 
   const q = $('search').value.trim().toLowerCase();
   const sort = $('sortSel').value;
@@ -284,11 +328,12 @@ function render(){
       <div class="meta">
         <div>${MODES[mode()].since}: <b class="${cls(c)}">${fmtPct(c)}</b></div>
         <div>Heute: <b class="${cls(s.day)}">${fmtPct(s.day)}</b></div>
-        <div>${MODES[mode()].base}: <b>${fmt(base(s))}</b></div>
+        <div>${MODES[mode()].base}${(()=>{const d=MODES[mode()].days; if(!d) return ''; const h=histBase(s,d); return h?' ('+(h.partial?'erst seit ':'')+ddmm(h.d)+')':'';})()}: <b>${fmt(base(s))}</b></div>
         <div>Kauf bei ≤ <b class="up">${base(s)?fmt(base(s)*(1-T/100)):'–'}</b></div>
         <div></div>
         <div>Verkauf bei ≥ <b class="down">${base(s)?fmt(base(s)*(1+T/100)):'–'}</b></div>
       </div>
+      <div class="periods-row">${['w1','m1','m3'].map(m=>{const v=changeFor(s,m);const h=histBase(s,MODES[m].days);return `<span>${MODES[m].chip}: <b class="${cls(v)}">${fmtPct(v)}</b>${h&&h.partial?'*':''}</span>`;}).join('')}</div>
       ${warn?`<div class="warn">${warn}</div>`:''}
       <div class="actions">
         <button class="small" onclick="trade('${s.id}','Gekauft')">✅ Gekauft</button>
@@ -446,7 +491,8 @@ async function refresh(silent){
       try{ msg = await loadFromFile(!silent); }
       catch(e){ err += (err?' · ':'')+'Hintergrund: '+(e.message||e); }
     }
-    if(msg && !silent) state.updated = new Date().toISOString(), save();
+    if(msg && !silent){ state.updated = new Date().toISOString(); recordLocal(); save(); }
+    await loadHistory(); render();
     $('status').textContent = msg
       ? `✅ ${msg} · ${manual} manuell` + (err && !silent ? ` (Info: ${err})` : '')
       : `❌ Keine Kurse geladen. ${err || 'Unter ⚙︎ Finnhub-Key eintragen.'}`;
