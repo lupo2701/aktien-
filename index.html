@@ -347,47 +347,74 @@ $('sortSel').onchange = render;
 const isUS = t => t && !t.includes('.') && !t.includes('=');
 const finnSym = t => t.replace('-', '.');           // BRK-B → BRK.B
 let loading = false;
+
+// Fallback: Kurse, die die GitHub Action im Hintergrund holt (prices.json im Repo)
+async function loadFromFile(){
+  const r = await fetch('prices.json?t='+Date.now(), {cache:'no-store'});
+  if(!r.ok) throw new Error('prices.json HTTP '+r.status);
+  const data = await r.json();
+  let ok=0;
+  for(const s of state.stocks){
+    const p = data.prices && data.prices[s.ticker];
+    if(p && p.eur){ s.cur=p.eur; s.day=p.day; s.missing=false; if(s.ref==null) s.ref=p.eur; ok++; }
+  }
+  if(data.usdEur) state.usdEur = data.usdEur;
+  save(); render();
+  const t = new Date(data.updated);
+  return `${ok} US-Werte (Stand ${t.toLocaleDateString('de-DE')} ${t.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'})}, Hintergrund-Abruf)`;
+}
+
+async function getUsdEur(){
+  for(const u of ['https://api.frankfurter.dev/v1/latest?from=USD&to=EUR','https://open.er-api.com/v6/latest/USD']){
+    try{
+      const j = await (await fetch(u)).json();
+      const v = (j.rates && j.rates.EUR);
+      if(v){ state.usdEur = v; return v; }
+    }catch(e){}
+  }
+  return state.usdEur || 0.86;   // letzter bekannter Kurs bzw. Näherung
+}
+
+// Direkt-Abruf bei Finnhub aus dem Browser (klappt nur, wenn Finnhub das zulässt)
+async function loadDirect(){
+  const usdEur = await getUsdEur();
+  const list = state.stocks.filter(s=>isUS(s.ticker));
+  let ok=0, fail=[];
+  for(let i=0;i<list.length;i++){
+    const s = list[i];
+    $('status').textContent = `Lade Kurse … ${i+1}/${list.length}`;
+    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(finnSym(s.ticker))}&token=${encodeURIComponent(state.apiKey)}`);
+    if(r.status===401 || r.status===403) throw new Error('API-Key ungültig (HTTP '+r.status+')');
+    if(r.status===429){ await new Promise(res=>setTimeout(res,5000)); i--; continue; }
+    const q = await r.json();
+    if(q && q.c){ s.cur=Math.round(q.c*usdEur*100)/100; s.day=q.dp; s.missing=false; if(s.ref==null) s.ref=s.cur; ok++; }
+    else { s.missing=true; fail.push(s.ticker); }
+    if(i % 10 === 9) render();
+    await new Promise(res=>setTimeout(res, i < 50 ? 60 : 1100));
+  }
+  save(); render();
+  return `${ok} US-Werte live`+(fail.length?` · nicht gefunden: ${fail.join(', ')}`:'');
+}
+
 async function refresh(silent){
   if(loading) return;
-  if(!state.apiKey){
-    if(!silent) $('status').textContent = 'Kein API-Key: unter ⚙︎ deinen Finnhub-Key eintragen.';
-    return;
-  }
   loading = true;
   const btn = $('btnRefresh'); btn.disabled = true;
+  if(!silent) $('status').textContent = 'Lade Kurse …';
+  const manual = state.stocks.filter(s=>!isUS(s.ticker)).length;
+  let msg = '', err = '';
   try{
-    let usdEur = state.usdEur || null;
-    try{
-      const fx = await (await fetch('https://api.frankfurter.app/latest?from=USD&to=EUR')).json();
-      if(fx && fx.rates && fx.rates.EUR) usdEur = state.usdEur = fx.rates.EUR;
-    }catch(e){}
-    if(!usdEur){ $('status').textContent = 'Wechselkurs USD→EUR nicht abrufbar – bitte später nochmal.'; return; }
-
-    const list = state.stocks.filter(s=>isUS(s.ticker));
-    let ok=0, fail=[];
-    for(let i=0;i<list.length;i++){
-      const s = list[i];
-      $('status').textContent = `Lade Kurse … ${i+1}/${list.length}`;
-      try{
-        const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(finnSym(s.ticker))}&token=${encodeURIComponent(state.apiKey)}`);
-        if(r.status===401 || r.status===403){ $('status').textContent='API-Key ungültig – bitte unter ⚙︎ prüfen.'; return; }
-        if(r.status===429){ await new Promise(res=>setTimeout(res,5000)); i--; continue; }
-        const q = await r.json();
-        if(q && q.c){
-          s.cur = Math.round(q.c*usdEur*100)/100; s.day = q.dp; s.missing = false;
-          if(s.ref==null) s.ref = s.cur;
-          ok++;
-        } else { s.missing = true; fail.push(s.ticker); }
-      }catch(e){ fail.push(s.ticker); }
-      if(i % 10 === 9) render();
-      // Gratis-Tarif: max. 60 Abfragen/Minute
-      await new Promise(res=>setTimeout(res, i < 50 ? 60 : 1100));
+    if(state.apiKey){
+      try{ msg = await loadDirect(); }
+      catch(e){ err = 'Direktabruf: '+(e.message||e); }
     }
-    state.updated = new Date().toISOString();
-    save(); render();
-    const manual = state.stocks.filter(s=>!isUS(s.ticker)).length;
-    $('status').textContent = `Aktualisiert ${new Date().toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'})} · ${ok} US-Werte live · ${manual} manuell`+
-      (fail.length?` · nicht gefunden: ${fail.join(', ')}`:'');
+    if(!msg){
+      try{ msg = await loadFromFile(); }
+      catch(e){ err += (err?' · ':'')+'Hintergrund: '+(e.message||e); }
+    }
+    $('status').textContent = msg
+      ? `✅ ${msg} · ${manual} manuell` + (err && !silent ? ` (Info: ${err})` : '')
+      : `❌ Keine Kurse geladen. ${err || 'Unter ⚙︎ Finnhub-Key eintragen.'}`;
   } finally { loading = false; btn.disabled = false; }
 }
 $('btnRefresh').onclick = ()=>refresh(false);
